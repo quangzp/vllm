@@ -1136,6 +1136,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    speculator_layers: set[str] | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1725,6 +1726,48 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
+def _identify_speculator_layers(
+    vllm_config: VllmConfig, all_layer_names: list[str]
+) -> set[str] | None:
+    """Identify speculator (drafter) layers so they can be kept in dedicated
+    KV cache group(s) instead of being scattered across the target model's
+    groups.
+
+    Detection order:
+    1. ``draft_model`` name prefix -- classical separate draft models are loaded
+       with ``prefix="draft_model"`` and use local 0-based layer indices, so the
+       index heuristic below does not catch them.
+    2. EAGLE-style appended layers whose global index exceeds the target model's
+       total layer count.
+    3. ``drafter``/``eagle`` name fallback for non-standard naming.
+    """
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    if vllm_config.speculative_config is None:
+        return None
+
+    target_num_layers = vllm_config.model_config.get_total_num_hidden_layers()
+
+    speculator_layers: set[str] = set()
+    for name in all_layer_names:
+        if "draft_model" in name:
+            speculator_layers.add(name)
+            continue
+        try:
+            if extract_layer_index(name) >= target_num_layers:
+                speculator_layers.add(name)
+        except (AssertionError, ValueError):
+            if "drafter" in name.lower() or "eagle" in name.lower():
+                speculator_layers.add(name)
+
+    if speculator_layers:
+        logger.info(
+            "Identified %d speculator (drafter) layers for KV cache grouping",
+            len(speculator_layers),
+        )
+    return speculator_layers or None
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1780,7 +1823,12 @@ def get_kv_cache_groups(
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    # Detect speculator (drafter) layers so they can be isolated into dedicated
+    # KV cache group(s) (dedicated per-spec-type grouping applied in Wall 2).
+    speculator_layers = _identify_speculator_layers(
+        vllm_config, list(filtered_spec.keys())
+    )
+    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, speculator_layers)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
