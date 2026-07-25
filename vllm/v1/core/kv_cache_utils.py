@@ -1207,6 +1207,33 @@ def _get_kv_cache_groups_uniform_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         same_type_layers[layer_spec].append(layer_name)
 
+    # Pull speculator (drafter) layers out into dedicated group(s) BEFORE the
+    # padding heuristic below, so they are not scattered across the target
+    # model's groups and do not skew the target group-size heuristic. Keep one
+    # dedicated group PER SPEC TYPE: a hybrid draft has both attention and
+    # short_conv layers (different specs) that must not be merged into a single
+    # mixed group (which would fail spec unification in create_kv_cache_group_specs).
+    speculator_groups: list[list[str]] = []
+    if speculator_layers:
+        for spec in list(same_type_layers.keys()):
+            drafter = [n for n in same_type_layers[spec] if n in speculator_layers]
+            if not drafter:
+                continue
+            remaining = [
+                n for n in same_type_layers[spec] if n not in speculator_layers
+            ]
+            if remaining:
+                same_type_layers[spec] = remaining
+            else:
+                del same_type_layers[spec]
+            speculator_groups.append(drafter)
+        if speculator_groups:
+            logger.info(
+                "Separated %d speculator layers into %d dedicated KV cache group(s)",
+                sum(len(g) for g in speculator_groups),
+                len(speculator_groups),
+            )
+
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
     # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
@@ -1254,6 +1281,10 @@ def _get_kv_cache_groups_uniform_page_size(
         # instead of layers[i * group_size: (i + 1) * group_size]
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
+    # Prepend each dedicated speculator group (one per spec type) so drafter
+    # layers occupy their own uniform-spec group(s), separate from the target.
+    for drafter_group in speculator_groups:
+        grouped_layers.insert(0, drafter_group)
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
