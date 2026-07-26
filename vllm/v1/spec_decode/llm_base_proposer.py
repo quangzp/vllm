@@ -993,6 +993,17 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
+        # A hybrid draft's short_conv (Mamba) metadata builder requires
+        # is_prefilling. The drafter runs on decode requests, so default it to
+        # all-False when unset; attention backends ignore this field. Draft
+        # state errors cannot corrupt output (the target verifies every token),
+        # so this only affects acceptance, not correctness.
+        if common_attn_metadata.is_prefilling is None:
+            common_attn_metadata = common_attn_metadata.replace(
+                is_prefilling=torch.zeros(
+                    common_attn_metadata.num_reqs, dtype=torch.bool
+                )
+            )
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
